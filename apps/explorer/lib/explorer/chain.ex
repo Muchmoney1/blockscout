@@ -363,9 +363,10 @@ defmodule Explorer.Chain do
     |> select_repo(options).all()
   end
 
-  @spec address_to_logs(Hash.Address.t(), Keyword.t()) :: [Log.t()]
+  @spec address_to_logs(Hash.Address.t(), [paging_options | necessity_by_association_option | api?]) :: [Log.t()]
   def address_to_logs(address_hash, csv_export?, options \\ []) when is_list(options) do
     paging_options = Keyword.get(options, :paging_options) || %PagingOptions{page_size: 50}
+    necessity_by_association = Keyword.get(options, :necessity_by_association, %{})
 
     case paging_options do
       %PagingOptions{key: {0, 0}} ->
@@ -402,13 +403,14 @@ defmodule Explorer.Chain do
             base
           else
             base
-            |> preload(transaction: [:to_address, :from_address])
+            |> preload(transaction: [from_address: [:proxy_implementations], to_address: [:proxy_implementations]])
           end
 
         preloaded_query
         |> page_logs(paging_options)
         |> filter_topic(Keyword.get(options, :topic))
         |> where_block_number_in_period(from_block, to_block)
+        |> join_associations(necessity_by_association)
         |> select_repo(options).all()
         |> Enum.take(paging_options.page_size)
     end
@@ -1674,7 +1676,7 @@ defmodule Explorer.Chain do
         elements
 
       blocks ->
-        blocks
+        blocks |> Repo.preload(Map.keys(necessity_by_association))
     end
   end
 
@@ -3009,7 +3011,7 @@ defmodule Explorer.Chain do
 
         {:error, reason} ->
           Logger.error(fn ->
-            ["Error while fetching first trace for tx: #{hash_string} error reason: ", reason]
+            ["Error while fetching first trace for tx: #{hash_string} error reason: ", inspect(reason)]
           end)
 
           fetch_tx_revert_reason_using_call(transaction)
@@ -3722,16 +3724,16 @@ defmodule Explorer.Chain do
   end
 
   @doc """
-  Streams a list of token contract addresses that have been cataloged.
+  Streams a list of tokens that have been cataloged.
   """
-  @spec stream_cataloged_token_contract_address_hashes(
+  @spec stream_cataloged_tokens(
           initial :: accumulator,
-          reducer :: (entry :: Hash.Address.t(), accumulator -> accumulator),
+          reducer :: (entry :: Token.t(), accumulator -> accumulator),
           some_time_ago_updated :: integer(),
           limited? :: boolean()
         ) :: {:ok, accumulator}
         when accumulator: term()
-  def stream_cataloged_token_contract_address_hashes(initial, reducer, some_time_ago_updated \\ 2880, limited? \\ false)
+  def stream_cataloged_tokens(initial, reducer, some_time_ago_updated \\ 2880, limited? \\ false)
       when is_function(reducer, 2) do
     some_time_ago_updated
     |> Token.cataloged_tokens()
@@ -4355,7 +4357,7 @@ defmodule Explorer.Chain do
     |> Instance.address_to_unique_token_instances()
     |> Instance.page_token_instance(paging_options)
     |> limit(^paging_options.page_size)
-    |> preload([_], [:owner])
+    |> preload([_], owner: [:names, :smart_contract, :proxy_implementations])
     |> select_repo(options).all()
     |> Enum.map(&put_owner_to_token_instance(&1, token, options))
   end
@@ -4381,7 +4383,16 @@ defmodule Explorer.Chain do
       |> Instance.owner_query()
       |> select_repo(options).one()
 
-    %{token_instance | owner: select_repo(options).get_by(Address, hash: owner_address_hash)}
+    owner =
+      Address.get(
+        owner_address_hash,
+        options
+        |> Keyword.merge(
+          necessity_by_association: %{names: :optional, smart_contract: :optional, proxy_implementations: :optional}
+        )
+      )
+
+    %{token_instance | owner: owner}
   end
 
   def put_owner_to_token_instance(%Instance{} = token_instance, _token, _options), do: token_instance
@@ -5246,11 +5257,11 @@ defmodule Explorer.Chain do
           result
 
         {:exit, reason} ->
-          Logger.warn("Query fetching token counters terminated: #{inspect(reason)}")
+          Logger.warning("Query fetching token counters terminated: #{inspect(reason)}")
           0
 
         nil ->
-          Logger.warn("Query fetching token counters timed out.")
+          Logger.warning("Query fetching token counters timed out.")
           0
       end
     end)

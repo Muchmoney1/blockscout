@@ -110,7 +110,7 @@ defmodule Explorer.Chain.Transaction.Schema do
                           elem(
                             quote do
                               has_one(:zksync_batch_transaction, ZkSyncBatchTransaction,
-                                foreign_key: :hash,
+                                foreign_key: :tx_hash,
                                 references: :hash
                               )
 
@@ -263,9 +263,10 @@ defmodule Explorer.Chain.Transaction do
   alias ABI.FunctionSelector
   alias Ecto.Association.NotLoaded
   alias Ecto.Changeset
-  alias Explorer.{Chain, PagingOptions, Repo, SortingHelper}
+  alias Explorer.{Chain, Helper, PagingOptions, Repo, SortingHelper}
 
   alias Explorer.Chain.{
+    Block,
     Block.Reward,
     ContractMethod,
     Data,
@@ -987,11 +988,11 @@ defmodule Explorer.Chain.Transaction do
            abi
            |> ABI.parse_specification()
            |> ABI.find_and_decode(data) do
-      {:ok, result}
+      {:ok, alter_inputs_names(result)}
     end
   rescue
     e ->
-      Logger.warn(fn ->
+      Logger.warning(fn ->
         [
           "Could not decode input data for transaction: ",
           Hash.to_iodata(hash),
@@ -1002,6 +1003,17 @@ defmodule Explorer.Chain.Transaction do
       {:error, :could_not_decode}
   end
 
+  defp alter_inputs_names({%FunctionSelector{input_names: names} = selector, mapping}) do
+    names =
+      names
+      |> Enum.with_index()
+      |> Enum.map(fn {name, index} ->
+        if name == "", do: "arg#{index}", else: name
+      end)
+
+    {%FunctionSelector{selector | input_names: names}, mapping}
+  end
+
   defp selector_mapping(selector, values, hash) do
     types = Enum.map(selector.types, &FunctionSelector.encode_type/1)
 
@@ -1010,7 +1022,7 @@ defmodule Explorer.Chain.Transaction do
     {:ok, mapping}
   rescue
     e ->
-      Logger.warn(fn ->
+      Logger.warning(fn ->
         [
           "Could not decode input data for transaction: ",
           Hash.to_iodata(hash),
@@ -1517,24 +1529,16 @@ defmodule Explorer.Chain.Transaction do
 
   defp compare_default_sorting(a, b) do
     case {
-      compare(a.block_number, b.block_number),
-      compare(a.index, b.index),
+      Helper.compare(a.block_number, b.block_number),
+      Helper.compare(a.index, b.index),
       DateTime.compare(a.inserted_at, b.inserted_at),
-      compare(Hash.to_integer(a.hash), Hash.to_integer(b.hash))
+      Helper.compare(Hash.to_integer(a.hash), Hash.to_integer(b.hash))
     } do
       {:lt, _, _, _} -> false
       {:eq, :lt, _, _} -> false
       {:eq, :eq, :lt, _} -> false
       {:eq, :eq, :eq, :gt} -> false
       _ -> true
-    end
-  end
-
-  defp compare(a, b) do
-    cond do
-      a < b -> :lt
-      a > b -> :gt
-      true -> :eq
     end
   end
 
@@ -1795,17 +1799,23 @@ defmodule Explorer.Chain.Transaction do
   end
 
   @doc """
-    Calculates effective gas price for transaction with type 2 (EIP-1559)
-
-    `effective_gas_price = priority_fee_per_gas + block.base_fee_per_gas`
+  Wrapper around `effective_gas_price/2`
   """
   @spec effective_gas_price(Transaction.t()) :: Wei.t() | nil
+  def effective_gas_price(%Transaction{} = transaction), do: effective_gas_price(transaction, transaction.block)
 
-  def effective_gas_price(%Transaction{block: nil}), do: nil
-  def effective_gas_price(%Transaction{block: %NotLoaded{}}), do: nil
+  @doc """
+  Calculates effective gas price for transaction with type 2 (EIP-1559)
 
-  def effective_gas_price(%Transaction{} = transaction) do
-    base_fee_per_gas = transaction.block.base_fee_per_gas
+  `effective_gas_price = priority_fee_per_gas + block.base_fee_per_gas`
+  """
+  @spec effective_gas_price(Transaction.t(), Block.t()) :: Wei.t() | nil
+
+  def effective_gas_price(%Transaction{}, %NotLoaded{}), do: nil
+  def effective_gas_price(%Transaction{}, nil), do: nil
+
+  def effective_gas_price(%Transaction{} = transaction, block) do
+    base_fee_per_gas = block.base_fee_per_gas
     max_priority_fee_per_gas = transaction.max_priority_fee_per_gas
     max_fee_per_gas = transaction.max_fee_per_gas
 
